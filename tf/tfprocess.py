@@ -166,6 +166,14 @@ class TFProcess:
                 tf.config.experimental.set_memory_growth(gpu, True)
             self.strategy = tf.distribute.MirroredStrategy()
             tf.distribute.experimental_set_strategy(self.strategy)
+        # From PR 145 (with a correction of the new isinstance check)
+        elif isinstance(self.cfg['gpu'], str) and "," in self.cfg['gpu']:
+            active_gpus = []
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            for i in self.cfg['gpu'].split(","):
+                active_gpus.append(int(i))
+            self.strategy = tf.distribute.MirroredStrategy(active_gpus)
+            tf.distribute.experimental_set_strategy(self.strategy)
         else:
             gpus = tf.config.experimental.list_physical_devices('GPU')
             print(gpus)

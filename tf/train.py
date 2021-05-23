@@ -149,11 +149,15 @@ def extract_invariance(raw):
 
 
 def extract_outputs(raw):
-    # winner is stored in one signed byte and needs to be converted to one hot.
-    winner = tf.cast(
-        tf.io.decode_raw(tf.strings.substr(raw, 8279, 1), tf.int8), tf.float32)
-    winner = tf.tile(winner, [1, 3])
-    z = tf.cast(tf.equal(winner, [1., 0., -1.]), tf.float32)
+
+    # (Taken from PR144)
+    # Result distribution needs to be calculated from q and d.
+    z_q = tf.io.decode_raw(tf.strings.substr(raw, 8308, 4), tf.float32)
+    z_d = tf.io.decode_raw(tf.strings.substr(raw, 8312, 4), tf.float32)
+    z_q_w = 0.5 * (1.0 - z_d + z_q)
+    z_q_l = 0.5 * (1.0 - z_d - z_q)
+
+    z = tf.concat([z_q_w, z_d, z_q_l], 1)
 
     # Outcome distribution needs to be calculated from q and d.
     best_q = tf.io.decode_raw(tf.strings.substr(raw, 8284, 4), tf.float32)
@@ -373,8 +377,9 @@ def main(cmd):
     num_chunks = cfg['dataset']['num_chunks']
     allow_less = cfg['dataset'].get('allow_less_chunks', False)
     train_ratio = cfg['dataset']['train_ratio']
-    experimental_parser = cfg['dataset'].get('experimental_v5_only_dataset',
-                                             False)
+    direct_dataset = cfg['dataset'].get('direct_dataset', False)
+    direct_randomize_files = cfg['dataset'].get('direct_randomize_files', True)
+
     num_train = int(num_chunks * train_ratio)
     num_test = num_chunks - num_train
     sort_type = cfg['dataset'].get('sort_type', 'mtime')
@@ -386,19 +391,20 @@ def main(cmd):
         sort_key_fn = identity_function
     else:
         raise ValueError('Unknown dataset sort_type: {}'.format(sort_type))
-    if 'input_test' in cfg['dataset']:
-        train_chunks = get_latest_chunks(cfg['dataset']['input_train'],
-                                         num_train, allow_less, sort_key_fn)
-        test_chunks = get_latest_chunks(cfg['dataset']['input_test'], num_test,
-                                        allow_less, sort_key_fn)
-    else:
-        chunks = get_latest_chunks(cfg['dataset']['input'], num_chunks,
-                                   allow_less, sort_key_fn)
-        if allow_less:
-            num_train = int(len(chunks) * train_ratio)
-            num_test = len(chunks) - num_train
-        train_chunks = chunks[:num_train]
-        test_chunks = chunks[num_train:]
+    if not direct_dataset:
+        if 'input_test' in cfg['dataset']:
+            train_chunks = get_latest_chunks(cfg['dataset']['input_train'],
+                                             num_train, allow_less, sort_key_fn)
+            test_chunks = get_latest_chunks(cfg['dataset']['input_test'], num_test,
+                                            allow_less, sort_key_fn)
+        else:
+            chunks = get_latest_chunks(cfg['dataset']['input'], num_chunks,
+                                       allow_less, sort_key_fn)
+            if allow_less:
+                num_train = int(len(chunks) * train_ratio)
+                num_test = len(chunks) - num_train
+            train_chunks = chunks[:num_train]
+            test_chunks = chunks[num_train:]
 
     shuffle_size = cfg['training']['shuffle_size']
     total_batch_size = cfg['training']['batch_size']
@@ -418,28 +424,15 @@ def main(cmd):
     if not os.path.exists(root_dir):
         os.makedirs(root_dir)
     tfprocess = TFProcess(cfg)
-    experimental_reads = max(2, mp.cpu_count() - 2) // 2
     extractor = select_extractor(tfprocess.INPUT_MODE)
 
-    if experimental_parser and (value_focus_min != 1
-                                or value_focus_slope != 0):
-        raise ValueError(
-            'Experimental parser does not support non-default value \
-                          focus parameters.')
-
-    def read(x):
-        return tf.data.FixedLengthRecordDataset(
-            x,
-            8308,
-            compression_type='GZIP',
-            num_parallel_reads=experimental_reads)
-
-    if experimental_parser:
-        train_dataset = tf.data.Dataset.from_tensor_slices(train_chunks).shuffle(len(train_chunks)).repeat().batch(256)\
-                         .interleave(read, num_parallel_calls=2)\
-                         .batch(SKIP_MULTIPLE*SKIP).map(semi_sample).unbatch()\
-                         .shuffle(shuffle_size)\
-                         .batch(split_batch_size).map(extractor)
+    if direct_dataset:
+        train_data_files = tf.io.gfile.glob(cfg['dataset']['input_train'])
+        print('Using direct dataset mode with training files ', train_data_files)
+        if direct_randomize_files:
+          train_data_files = tf.random.shuffle(train_data_files, seed=random.seed())
+        train_dataset = tf.data.FixedLengthRecordDataset(train_data_files, record_bytes=8356, compression_type='GZIP')
+        train_dataset = train_dataset.batch(split_batch_size).map(extractor).repeat().prefetch(8)
     else:
         train_parser = ChunkParser(train_chunks,
                                    tfprocess.INPUT_MODE,
@@ -456,12 +449,13 @@ def main(cmd):
         train_dataset = train_dataset.map(ChunkParser.parse_function)
 
     shuffle_size = int(shuffle_size * (1.0 - train_ratio))
-    if experimental_parser:
-        test_dataset = tf.data.Dataset.from_tensor_slices(test_chunks).shuffle(len(test_chunks)).repeat().batch(256)\
-                         .interleave(read, num_parallel_calls=2)\
-                         .batch(SKIP_MULTIPLE*SKIP).map(semi_sample).unbatch()\
-                         .shuffle(shuffle_size)\
-                         .batch(split_batch_size).map(extractor)
+    if direct_dataset:
+        test_data_files = tf.io.gfile.glob(cfg['dataset']['input_test'])
+        print('Using direct dataset mode with test files ', test_data_files)
+        if direct_randomize_files:
+          test_data_files = tf.random.shuffle(test_data_files, seed=random.seed())
+        test_dataset = tf.data.FixedLengthRecordDataset(test_data_files, record_bytes=8356, compression_type='GZIP')
+        test_dataset = test_dataset.batch(split_batch_size).map(extractor).repeat().prefetch(8)
     else:
         # no value focus for test_parser
         test_parser = ChunkParser(test_chunks,
@@ -502,7 +496,7 @@ def main(cmd):
     # For simplicity, testing can use the split batch size instead of total batch size.
     # This does not affect results, because test results are simple averages that are independent of batch size.
     num_evals = cfg['training'].get('num_test_positions',
-                                    len(test_chunks) * 10)
+                                    100000 if direct_dataset else len(test_chunks) * 10)
     num_evals = max(1, num_evals // ChunkParser.BATCH_SIZE)
     print("Using {} evaluation batches".format(num_evals))
     tfprocess.total_batch_size = total_batch_size
